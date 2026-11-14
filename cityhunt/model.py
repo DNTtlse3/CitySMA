@@ -87,15 +87,20 @@ class CityHuntModel(mesa.Model):
     def _spawn(self, n_police, n_fugitives, n_civilians,
                police_speed, fugitive_speed, civilian_speed, perception_m) -> None:
         rng = self.random
-        zone_ids = sorted(self.zones.zones)
+        all_nodes = list(self.network.graph.nodes)
+        zone_ids = self.zones.explorable_zones
         for i in range(n_police):
             node = self.zones.random_node_in_zone(rng, zone_ids[i % len(zone_ids)])
+            if node is None:
+                node = rng.choice(all_nodes)
             PoliceAgent(self, f"Police-{i + 1}", node, police_speed, perception_m)
         for i in range(n_fugitives):
             node = self.zones.random_node_in_zone(rng, zone_ids[-(i % len(zone_ids)) - 1])
+            if node is None:
+                node = rng.choice(all_nodes)
             FugitiveAgent(self, f"Fugitif-{i + 1}", node, fugitive_speed, perception_m)
         for i in range(n_civilians):
-            node = rng.choice(list(self.network.graph.nodes))
+            node = rng.choice(all_nodes)
             CivilAgent(self, f"Civil-{i + 1}", node, civilian_speed)
 
         police = [a.name for a in self.police()]
@@ -156,7 +161,7 @@ class CityHuntModel(mesa.Model):
             return
         if self.random.random() > self.signal_probability:
             return
-        zone_id = self.random.choice(sorted(self.zones.zones))
+        zone_id = self.random.choice(self.zones.explorable_zones)
         self.signalements.create(zone_id, self.step_count,
                                  priority=self.random.choice([1, 1, 2]),
                                  confidence=round(self.random.uniform(0.6, 1.0), 2),

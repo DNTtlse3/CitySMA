@@ -220,3 +220,30 @@ def test_mesa_agentset_integrite():
     model.step()
     assert len(list(model.agents)) == 7
     assert model.datacollector.model_vars["coverage"], "DataCollector Mesa inactif."
+
+
+# --------------------------------------------------------------------------- #
+# Régression — zones OSM sans rue (bbox réelle : fleuves, zones industrielles) #
+# --------------------------------------------------------------------------- #
+
+def test_zones_vides_reseau_osm():
+    network = load_synthetic_network(size=12, seed=42)
+    lat_min, lat_max, lon_min, lon_max = network.bbox()
+    orphans = [n for n, d in network.graph.nodes(data=True)
+               if d["y"] < lat_min + (lat_max - lat_min) / 4
+               and d["x"] < lon_min + (lon_max - lon_min) / 4]
+    assert orphans, "Configuration de test invalide : aucun nœud à retirer."
+    network.graph.remove_nodes_from(orphans)
+
+    model = CityHuntModel(network=network, zone_cols=4, zone_rows=4,
+                          n_police=1, n_fugitives=1, n_civilians=2, seed=7,
+                          signal_interval=1000, signal_probability=0.0)
+    assert len(model.zones.explorable_zones) < len(model.zones.zones), \
+        "Une zone devrait être vide (sans nœud)."
+    assert all(a.position is not None for a in model.agents), \
+        "Un agent a été spawné hors du réseau (position None)."
+
+    for _ in range(400):
+        model.step()
+    assert model.global_coverage() == 1.0, (
+        f"Couverture incomplète : {model.global_coverage():.0%} (zones explorables uniquement)")

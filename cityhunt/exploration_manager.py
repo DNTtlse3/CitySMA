@@ -18,12 +18,13 @@ class ExplorationManager:
         return agent.memory.exploration_ratio()
 
     def global_coverage(self, strategic_agents) -> float:
-        """Proportion de zones visitées par au moins un agent stratégique."""
-        all_zones = set(self.zone_manager.zones)
+        """Proportion de zones explorables visitées par au moins un agent stratégique."""
+        explorable = getattr(self.zone_manager, "explorable_zones", None)
+        all_zones = set(explorable) if explorable is not None else set(self.zone_manager.zones)
         visited: set[int] = set()
         for a in strategic_agents:
             visited |= a.memory.visited_zones
-        return len(visited) / len(all_zones) if all_zones else 0.0
+        return len(visited & all_zones) / len(all_zones) if all_zones else 0.0
 
     def exploration_complete(self, agent) -> bool:
         return not agent.memory.has_unvisited_zones()

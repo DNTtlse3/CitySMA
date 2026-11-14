@@ -75,6 +75,7 @@ class ZoneManager:
             zid = self._locate(data["y"], data["x"])
             self.zones[zid].nodes.append(node)
             self.node_zone[node] = zid
+        self.explorable_zones = [zid for zid, z in self.zones.items() if z.nodes]
 
     def _locate(self, lat: float, lon: float) -> int:
         dlat = (self.lat_max - self.lat_min) / self.rows

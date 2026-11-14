@@ -32,6 +32,15 @@ def build_map(model, focus_agent=None, path_on_map: bool = True) -> folium.Map:
                    control_scale=True)
 
     for zone in model.zones.zones.values():
+        if not zone.nodes:
+            lat_min, lat_max, lon_min, lon_max = zone.bounds
+            folium.Rectangle(
+                bounds=[[lat_min, lon_min], [lat_max, lon_max]],
+                color="#9aa5b1", weight=1, fill=True,
+                fill_color="#e4e4e4", fill_opacity=0.35,
+                tooltip=f"Zone {zone.id} · hors réseau (aucune rue)",
+            ).add_to(m)
+            continue
         state = UNKNOWN
         if focus_agent is not None and focus_agent.is_strategic:
             state = focus_agent.memory.state_of(zone.id)
