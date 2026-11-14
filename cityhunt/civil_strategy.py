@@ -1,7 +1,8 @@
 """Stratégie des civils (module civil_strategy).
 
-Les civils conservent un déplacement purement aléatoire (exigence F03).
-Ils ne possèdent ni mémoire spatiale stratégique ni moteur de décision.
+Les civils conservent un déplacement purement aléatoire (exigence F03) :
+à chaque pas ils marchent vers un nœud voisin choisi au hasard.
+Ils ne possèdent ni mémoire stratégique ni moteur de décision.
 """
 
 from __future__ import annotations
@@ -13,16 +14,9 @@ class CivilStrategy:
     def __init__(self, decision_engine=None):
         self.engine = decision_engine
 
-    def decide(self, agent, env) -> None:
-        rng = env.rng
-        zn = env.zone_manager
-        x, y = agent.position
-        options = []
-        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-            nxt = (x + dx, y + dy)
-            if 0 <= nxt[0] < zn.width and 0 <= nxt[1] < zn.height and nxt not in zn.obstacles:
-                options.append(nxt)
+    def decide(self, agent, model) -> None:
+        options = model.network.neighbors(agent.position)
         if not options:
             agent.set_path([])
             return
-        agent.path = [rng.choice(options)]
+        agent.path = [model.random.choice(options)]

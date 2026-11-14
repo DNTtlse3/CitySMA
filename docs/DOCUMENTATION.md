@@ -1,20 +1,20 @@
-# CityHunt v2.0 — Documentation fonctionnelle et technique
+# CityHunt v3.0 — Documentation fonctionnelle et technique
 
-**Type :** Système multi-agents (SMA) · **UI :** Streamlit · **Version :** 2.0
+**Type :** Système multi-agents (SMA) · **Moteur :** Mesa · **Carte :** OpenStreetMap (OSMnx + Folium) · **UI :** Streamlit · **Version :** 3.0
 
-Ce document décrit l'implémentation de la spécification CityHunt v2.0 :
-mémoire spatiale individuelle, exploration méthodique, signalements,
-coordination policière, pathfinding A* et apprentissage par renforcement.
+Ce document décrit l'implémentation de la spécification CityHunt sur le réseau
+de rues réel d'une ville : mémoire spatiale individuelle, exploration
+méthodique, signalements, coordination policière, pathfinding A* sur le graphe
+OSM, apprentissage par renforcement et visualisation temps réel.
 
 ---
 
 ## 1. Architecture générale
 
-Chaque responsabilité de la spécification (§10) correspond à un module Python :
-
 | Module | Responsabilité | Spéc. |
 |---|---|---|
-| `zone_manager.py` | Découpage de la carte en zones, voisins, obstacles | §4 |
+| `osm_network.py` | Réseau de rues réel (OSMnx/Overpass) + repli hors-ligne synthétique | carte |
+| `zone_manager.py` | Partition géographique de la bbox OSM en zones | §4 |
 | `spatial_memory.py` | Mémoire spatiale individuelle (`SpatialMemory`) | §5 |
 | `exploration_manager.py` | Couverture, historique, fin d'exploration | §7 |
 | `decision_engine.py` | Scores de zones et sélection des destinations | §6 |
@@ -23,259 +23,227 @@ Chaque responsabilité de la spécification (§10) correspond à un module Pytho
 | `civil_strategy.py` | Déplacement aléatoire | §3.3 |
 | `coordination_manager.py` | Partage d'informations et réservations | §8 |
 | `signalement_manager.py` | Cycle de vie des signalements | §7.3 |
-| `pathfinding.py` | Itinéraires A* | §9 |
-| `movement_controller.py` | Exécution des déplacements | §9 |
+| `pathfinding.py` | Itinéraires A* sur le graphe de rues | §9 |
+| `movement_controller.py` | Exécution des déplacements (nœud par nœud) | §9 |
 | `rl_module.py` | Récompenses et Q-values | §12 |
-| `agents.py`, `environment.py`, `simulation.py` | Agents, perception, boucle | §10 |
+| `agents.py` | Agents Mesa (`PoliceAgent`, `FugitiveAgent`, `CivilAgent`) | §10 |
+| `model.py` | `CityHuntModel` (hérite de `mesa.Model`) | §10 |
+| `map_render.py` | Rendu Folium sur tuiles OpenStreetMap | temps réel |
+| `app.py` | Interface Streamlit temps réel | UI |
 
 ```mermaid
 flowchart TD
-    ENV["Environnement<br/>environment.py"]
-    ENV --> PER["Perception<br/>rayon limité, aucune omniscience"]
+    OSM["OpenStreetMap<br/>(Overpass via OSMnx)"] --> NET["CityNetwork<br/>osm_network.py"]
+    NET --> MODEL["CityHuntModel<br/>mesa.Model"]
+
+    MODEL --> PER["Perception<br/>haversine, rayon limité"]
     PER --> MEM["Mémoire spatiale<br/>spatial_memory.py"]
     MEM --> DEC["Moteur de décision<br/>decision_engine.py"]
-    DEC --> STR["Stratégie selon le rôle"]
+    DEC --> STR["Stratégies Mesa"]
 
     STR --> POL["police_strategy"]
     STR --> FUG["fugitive_strategy"]
-    STR --> CIV["civil_strategy"]
+    STR --> CIV["civil_strategy (aléatoire)"]
 
-    POL --> COORD["Coordination policière<br/>coordination_manager"]
+    POL --> COORD["Coordination<br/>coordination_manager"]
     COORD --> SIG["Signalements<br/>signalement_manager"]
 
-    POL --> PATH["A*<br/>pathfinding"]
+    POL --> PATH["A* networkx<br/>pathfinding"]
     FUG --> PATH
-    CIV --> RAND["Déplacement aléatoire"]
 
     PATH --> MOVE["movement_controller"]
-    RAND --> MOVE
+    MOVE --> MODEL
 
-    MOVE --> ENV
+    MODEL --> FOLIUM["map_render.py<br/>Folium + tuiles OSM"]
+    FOLIUM --> UI["Streamlit<br/>temps réel"]
     DEC -. bonus Q .-> RL["rl_module"]
 ```
 
 ---
 
-## 2. Diagramme de classes UML
+## 2. Diagramme de classes UML (Mesa)
 
 ```mermaid
 classDiagram
+    class mesa_Model {
+        <<framework>>
+        +random Random
+        +agents AgentSet
+        +step()
+    }
+
+    class mesa_Agent {
+        <<framework>>
+        +unique_id int
+        +model Model
+    }
+
+    class CityHuntModel {
+        +int step_count
+        +CityNetwork network
+        +ZoneManager zones
+        +PathFinder pathfinder
+        +SignalementManager signalements
+        +CoordinationManager coordination
+        +ExplorationManager exploration
+        +MovementController movement
+        +DecisionEngine engine
+        +DataCollector datacollector
+        +step()
+        +visible_police(fugitive) list
+        +visible_fugitives(officer) list
+        +global_coverage() float
+        +summary() dict
+    }
+
+    class CityAgent {
+        +str name
+        +str role
+        +position node
+        +int speed
+        +float perception_m
+        +SpatialMemory memory
+        +RLModule rl
+        +list path
+        +perceive()
+        +act()
+        +current_zone() int
+        +coords() tuple
+    }
+
+    class PoliceAgent {
+        +PoliceStrategy strategy
+    }
+
+    class FugitiveAgent {
+        +FugitiveStrategy strategy
+        +float PANIC_RADIUS_M
+    }
+
+    class CivilAgent {
+        +CivilStrategy strategy
+    }
+
     class Zone {
         +int id
-        +tuple position
         +tuple bounds
-        +set~int~ neighbors
-        +set~str~ visited_by
+        +tuple center
+        +set neighbors
+        +list nodes
+        +set visited_by
         +dict last_visit
-        +list signals
-        +contains(cell) bool
-        +cells() list
-        +center() tuple
     }
 
     class ZoneManager {
-        +dict~int~Zone~ zones
-        +set obstacles
-        +zone_of(cell) int
-        +free_cells(zone_id) list
-        +random_free_cell(rng, zone_id) tuple
+        +dict zones
+        +dict node_zone
+        +zone_of(node) int
+        +nearest_zone_node(zone, point)
+        +farthest_zone_node_from(zone, point)
         +distance(a, b) float
     }
 
-    class ZoneKnowledge {
-        +str state
-        +int last_visit_step
-        +int visit_count
-        +float danger_level
-        +float police_presence
+    class CityNetwork {
+        +Graph graph
+        +str source
+        +coords(node) tuple
+        +bbox() tuple
+        +neighbors(node) list
+        +edge_length(u, v) float
     }
 
     class SpatialMemory {
         +set visited_zones
         +set unvisited_zones
-        +int current_zone
         +list exploration_history
-        +list known_signals
         +dict known_dangers
-        +tuple last_position
-        +int last_target
-        +int assigned_sector
-        +dict~int~ZoneKnowledge~ knowledge
-        +visit_zone(zone_id, step)
-        +add_signal(signal)
-        +add_danger(zone_id, level)
-        +has_unvisited_zones() bool
+        +visit_zone(zone, step)
+        +add_danger(zone, level)
+        +state_of(zone) str
         +exploration_ratio() float
-        +state_of(zone_id) str
     }
 
-    class Signalement {
-        +str id
-        +int zone_id
-        +int timestamp
-        +str status
-        +int priority
-        +float confidence
-        +set assigned_to
-        +age(step) int
+    class PathFinder {
+        +find_path(start, goal, danger) list
+        -weight(u, v, data) float
     }
 
     class SignalementManager {
-        +dict signals
-        +create(zone_id, step) Signalement
+        +create(zone, step) Signalement
         +assign(id, agent)
         +resolve(id)
-        +expire(step)
         +pending(step) list
-        +relevance(sig, step) float
-    }
-
-    class DecisionEngine {
-        +PoliceWeights police_weights
-        +FugitiveWeights fugitive_weights
-        +score_for_police(memory, z, step, d) float
-        +score_for_fugitive(memory, z, step, d) float
-        +rank_zones(role, memory, step, distances, candidates) list
-    }
-
-    class AgentStrategy {
-        <<interface>>
-        +role str
-        +decide(agent, env)
-    }
-
-    class PoliceStrategy {
-        +decide(agent, env)
-        -_priority_signal(agent, env)
-        -_exploration_candidates(agent, env)
-        -_patrol_or_revisit(agent, env, step)
-    }
-
-    class FugitiveStrategy {
-        +int PANIC_RADIUS
-        +decide(agent, env)
-        -_flee(agent, env, police)
-    }
-
-    class CivilStrategy {
-        +decide(agent, env)
     }
 
     class CoordinationManager {
-        +dict claimed_zones
-        +dict assigned_signals
-        +dict inspected_zones
-        +dict sectors
         +assign_sectors(police, zones)
         +claim_zone(zone, agent) bool
         +take_unassigned_signal(agent, step)
         +share_observation(...)
     }
 
-    class PathFinder {
-        +find_path(start, goal, danger) list
-        -cell_cost(cell, danger) float
-        -heuristic(a, b) float
-    }
-
-    class MovementController {
-        +move(agent, speed) int
-        +route_is_blocked(agent) bool
+    class DecisionEngine {
+        +rank_zones(role, memory, step, distances, candidates) list
+        +score_for_police(...) float
+        +score_for_fugitive(...) float
     }
 
     class RLModule {
-        +dict q
-        +float cumulative_reward
         +reward(event, zone, step) float
         +bonus(zone) float
     }
 
-    class Agent {
-        +str id
-        +str role
-        +tuple position
-        +int speed
-        +int perception_radius
-        +list path
-        +bool alive
-        +is_strategic() bool
-        +set_path(path)
-    }
-
-    class Environment {
-        +int step_count
-        +ZoneManager zone_manager
-        +PathFinder pathfinder
-        +SignalementManager signalements
-        +CoordinationManager coordination
-        +ExplorationManager exploration
-        +MovementController movement
-        +register(agents)
-        +step()
-        +visible_police(agent) list
-        +visible_fugitives(agent) list
-        +path_to(agent, cell) list
-    }
-
-    class Simulation {
-        +SimulationConfig config
-        +run(steps)
-        +step_once()
-        +summary() dict
-    }
-
-    ZoneManager "1" o-- "20" Zone
-    SpatialMemory *-- ZoneKnowledge
-    SignalementManager "1" o-- "*" Signalement
-    Agent *-- "1" SpatialMemory
-    Agent *-- "1" RLModule
-    Agent --> AgentStrategy : strategy
-    PoliceStrategy ..|> AgentStrategy
-    FugitiveStrategy ..|> AgentStrategy
-    CivilStrategy ..|> AgentStrategy
-    PoliceStrategy --> DecisionEngine
-    FugitiveStrategy --> DecisionEngine
-    PoliceStrategy --> CoordinationManager
+    mesa_Model <|-- CityHuntModel
+    mesa_Agent <|-- CityAgent
+    CityAgent <|-- PoliceAgent
+    CityAgent <|-- FugitiveAgent
+    CityAgent <|-- CivilAgent
+    CityHuntModel "1" o-- "*" CityAgent
+    CityHuntModel *-- CityNetwork
+    CityHuntModel *-- ZoneManager
+    CityHuntModel *-- PathFinder
+    CityHuntModel *-- SignalementManager
+    CityHuntModel *-- CoordinationManager
+    CityHuntModel *-- MovementController
+    CityHuntModel *-- DecisionEngine
+    CityAgent *-- SpatialMemory
+    CityAgent *-- RLModule
+    CityAgent --> CityNetwork : position (nœud)
+    ZoneManager "1" o-- "*" Zone
+    ZoneManager --> CityNetwork
+    PathFinder --> CityNetwork
+    PathFinder --> ZoneManager
     CoordinationManager --> SignalementManager
-    Environment *-- ZoneManager
-    Environment *-- PathFinder
-    Environment *-- SignalementManager
-    Environment *-- CoordinationManager
-    Environment *-- MovementController
-    Environment "1" o-- "*" Agent
-    Simulation *-- Environment
-    Agent ..> PathFinder : via Environment
+    PoliceAgent --> DecisionEngine
+    FugitiveAgent --> DecisionEngine
 ```
 
 ---
 
 ## 3. Diagramme d'objets (OD) — instantané de simulation
 
-Exemple d'état au pas 42 : deux policiers, un fugitif, un civil.
+État au pas 42 sur la carte de Toulouse : deux policiers, un fugitif, un civil.
 
 ```mermaid
 objectDiagram
-    object "Police-1 : Agent" as p1
-    p1 : id = "Police-1"
-    p1 : role = "police"
-    p1 : position = (7, 3)
-    p1 : speed = 2
+    object "CityHuntModel : CityHuntModel" as model
+    model : step_count = 42
+    model : source = "osm"
 
-    object "mem1 : SpatialMemory" as m1
+    object "Police-1 : PoliceAgent" as p1
+    p1 : position = node 12345678
+    p1 : speed = 2
+    p1 : perception_m = 250.0
+
+    object "m1 : SpatialMemory" as m1
     m1 : visited_zones = {0, 1, 5, 6}
-    m1 : unvisited_zones = {2, 3, 4, 7, ...}
+    m1 : unvisited_zones = {2, 3, 4, ...}
     m1 : current_zone = 6
 
-    object "k6 : ZoneKnowledge" as k6
-    k6 : state = "explorée"
-    k6 : visit_count = 2
-    k6 : danger_level = 0.0
+    object "Fugitif-1 : FugitiveAgent" as f1
+    f1 : position = node 98765432
 
-    object "Fugitif-1 : Agent" as f1
-    f1 : role = "fugitive"
-    f1 : position = (18, 15)
-
-    object "memF : SpatialMemory" as mf
+    object "mF : SpatialMemory" as mf
     mf : known_dangers = {6: 0.4}
     mf : unvisited_zones = {8, 9, 13, ...}
 
@@ -284,14 +252,20 @@ objectDiagram
     s7 : status = "investigating"
     s7 : priority = 2
 
-    object "Civil-1 : Agent" as c1
-    c1 : role = "civil"
-    c1 : position = (11, 9)
+    object "Civil-1 : CivilAgent" as c1
+    c1 : position = node 55512344
 
+    object "Z6 : Zone" as z6
+    z6 : center = (43.6061, 1.4442)
+    z6 : visited_by = {"Police-1"}
+
+    model o-- p1
+    model o-- f1
+    model o-- c1
     p1 *-- m1
-    m1 *-- k6
     f1 *-- mf
     s7 --> p1 : assigned_to
+    z6 --> model : zones[6]
 ```
 
 ---
@@ -300,21 +274,21 @@ objectDiagram
 
 ```mermaid
 flowchart TD
-    A([Début du cycle]) --> B["Observer l'environnement<br/>(perception, rayon limité)"]
-    B --> C["Actualiser la mémoire<br/>visit_zone(zone courante)"]
-    C --> D{"Signalement<br/>prioritaire ?"}
-    D -->|Oui| E["Évaluer et réserver<br/>le signalement"]
+    A([Début du pas Mesa]) --> B["perceive() : observer l'environnement<br/>(haversine ≤ rayon, aucune omniscience)"]
+    B --> C["Mémoire : visit_zone(zone du nœud courant)"]
+    C --> D{"Signalement prioritaire ?"}
+    D -->|Oui| E["Réserver et évaluer<br/>le signalement"]
     D -->|Non| F{"Zones inconnues<br/>accessibles ?"}
-    F -->|Oui| G["Sélectionner la meilleure<br/>zone inconnue (score)"]
+    F -->|Oui| G["Meilleure zone inconnue<br/>(score du moteur de décision)"]
     F -->|Non| H["Revisiter une zone<br/>ou patrouiller le secteur"]
-    E --> I["Calculer l'itinéraire A*"]
+    E --> I["A* networkx vers la zone<br/>(poids majorés du danger connu)"]
     G --> I
     H --> I
-    I --> J["Se déplacer<br/>(movement_controller)"]
-    J --> K["Enregistrer la progression<br/>mémoire + récompenses RL"]
-    K --> L([Fin du cycle])
+    I --> J["act() : avancer de speed nœuds<br/>(movement_controller)"]
+    J --> K["Mémoire + récompenses RL"]
+    K --> L([Fin du pas])
 
-    D2(["Spécifique fugitif"]) --> D3{"Policier visible<br/>≤ PANIC_RADIUS ?"}
+    D2(["Spécifique fugitif"]) --> D3{"Policier visible<br/>≤ 300 m ?"}
     D3 -->|Oui| D4["Fuir : zone voisine la plus<br/>sûre et la plus éloignée"]
     D3 -->|Non| F
     D4 --> I
@@ -322,35 +296,37 @@ flowchart TD
 
 ---
 
-## 5. Diagramme de séquence — un pas de simulation
+## 5. Diagramme de séquence — un pas de simulation Mesa
 
 ```mermaid
 sequenceDiagram
-    participant S as Simulation
-    participant E as Environment
-    participant A as Agent (police)
-    participant M as SpatialMemory
-    participant D as DecisionEngine
-    participant P as PathFinder
-    participant MV as MovementController
+    participant U as Streamlit (temps réel)
+    participant M as CityHuntModel
+    participant A as PoliceAgent
+    participant MEM as SpatialMemory
     participant C as CoordinationManager
+    participant D as DecisionEngine
+    participant PF as PathFinder (A*)
+    participant MV as MovementController
+    participant OSM as Réseau OSM
 
-    S->>E: step()
-    E->>E: _maybe_spawn_signal()
-    E->>A: _perceive(agent)
-    A->>M: add_danger / observations
-    E->>A: strategy.decide(agent, env)
+    U->>M: step()
+    M->>M: _maybe_spawn_signal()
+    M->>A: perceive()
+    A->>MEM: add_danger / observation partagée
+    M->>A: act()
     A->>C: take_unassigned_signal() / claim_zone()
     C-->>A: signalement attribué
     A->>D: rank_zones(role, memory, step, distances)
     D-->>A: zones classées par score
-    A->>P: find_path(position, cible, danger)
-    P-->>A: itinéraire (liste de cellules)
+    A->>PF: find_path(nœud courant, nœud cible, dangers)
+    PF->>OSM: graphe de rues (longueurs réelles)
+    PF-->>A: itinéraire (liste de nœuds)
     A->>MV: move(agent, speed)
-    MV-->>E: cellules parcourues
-    E->>M: visit_zone(zone, step)
-    E->>E: _resolve_signals() / _check_interceptions()
-    E-->>S: fin du pas
+    MV-->>M: nœuds parcourus
+    A->>MEM: visit_zone(zone, step)
+    M->>M: _resolve_signals() / _check_interceptions()
+    M-->>U: DataCollector.collect() → carte OSM rafraîchie
 ```
 
 ---
@@ -399,44 +375,53 @@ stateDiagram-v2
 
 ```mermaid
 flowchart LR
+    subgraph EXT["Services externes"]
+        OVER["Overpass API<br/>(données OSM)"]
+        TILES["Tuiles OpenStreetMap<br/>(fond de carte)"]
+    end
+
     subgraph UI["Interface Streamlit (app.py)"]
         W1["Contrôles (sidebar)"]
-        W2["Carte Plotly"]
+        W2["st_folium — carte temps réel"]
         W3["Métriques / Mémoire / Journal"]
     end
 
-    subgraph CORE["Cœur SMA (package cityhunt)"]
-        SIM["simulation"]
-        ENV["environment"]
-        STRAT["stratégies (police / fugitif / civil)"]
+    subgraph MESA["Moteur Mesa (package cityhunt)"]
+        MODEL["CityHuntModel"]
+        AG["PoliceAgent / FugitiveAgent / CivilAgent"]
+        STRAT["stratégies"]
         DEC["decision_engine"]
         MEM["spatial_memory"]
         ZM["zone_manager"]
         COORD["coordination_manager"]
         SIG["signalement_manager"]
-        PF["pathfinding"]
+        PF["pathfinding (A*)"]
         MV["movement_controller"]
         RL["rl_module"]
-        EXP["exploration_manager"]
+        FOL["map_render (Folium)"]
     end
 
     subgraph TESTS["Validation"]
-        T["pytest — 5 scénarios §14"]
+        T["pytest — scénarios §14 (hors-ligne)"]
     end
 
-    UI --> SIM
-    SIM --> ENV
-    ENV --> STRAT
+    OVER --> NETW["osm_network"]
+    NETW --> MODEL
+    UI --> MODEL
+    MODEL --> AG
+    AG --> STRAT
     STRAT --> DEC
     STRAT --> MEM
     STRAT --> PF
     STRAT --> COORD
     COORD --> SIG
-    ENV --> ZM
-    ENV --> MV
-    ENV --> RL
-    ENV --> EXP
-    T --> CORE
+    MODEL --> ZM
+    MODEL --> MV
+    MODEL --> RL
+    MODEL --> FOL
+    FOL --> W2
+    TILES -.-> W2
+    T --> MESA
 ```
 
 ---
@@ -445,21 +430,36 @@ flowchart LR
 
 ```mermaid
 flowchart LR
-    subgraph POSTE["Poste de l'utilisateur"]
-        Browser["Navigateur<br/>http://localhost:8501"]
-        subgraph RUNTIME["Runtime Python 3.10+"]
-            ST["Processus Streamlit<br/>streamlit run app.py"]
-            PY["Interpréteur Python<br/>package cityhunt (SMA)"]
+    subgraph NAV["Navigateur de l'utilisateur"]
+        LEAF["Leaflet / Folium<br/>tuiles OpenStreetMap"]
+    end
+
+    subgraph SERVEUR["Machine hôte (Python 3.10+)"]
+        subgraph ST["Processus Streamlit"]
+            APP["app.py"]
+            CACHE["Cache Streamlit<br/>(réseau OSM)"]
+        end
+        subgraph PY["Environnement Python"]
+            MESA["cityhunt (Mesa SMA)"]
+            OSMNX["OSMnx / networkx"]
         end
     end
-    Browser <--> ST
-    ST --> PY
+
+    OVERPASS["Overpass API"]
+    OSM_TILES["tile.openstreetmap.org"]
+
+    APP --> MESA
+    MESA --> OSMNX
+    OSMNX -->|téléchargement du réseau| OVERPASS
+    APP --> CACHE
+    LEAF <-->|HTTP| OSM_TILES
+    LEAF <-->|WebSocket| ST
 ```
 
-Déploiement mono-processus, sans base de données ni service externe : l'état de
-la simulation vit dans la session Streamlit (`st.session_state`). Pour un
-déploiement multi-utilisateur, lancer `streamlit run app.py --server.port 8501`
-derrière un reverse proxy interne.
+- **Un seul processus** Streamlit héberge le modèle Mesa ; l'état vit dans `st.session_state`.
+- Le **réseau de rues** est téléchargé une seule fois par ville (cache `st.cache_resource`).
+- Les **tuiles OpenStreetMap** sont chargées directement par le navigateur (Leaflet).
+- Si Overpass est injoignable, `osm_network` bascule sur la grille synthétique : la simulation reste opérationnelle et le fond de carte reste OSM.
 
 ---
 
@@ -467,14 +467,14 @@ derrière un reverse proxy interne.
 
 ### 9.1 Scores (§6 de la spécification)
 
-**Police** — `Score(z) = w1·S(z) + w2·P(z) + w3·U(z) − w4·D(z)`
+**Police** — `Score(z) = w1·S(z) + w2·P(z) + w3·U(z) − w4·D(z)` (distances en km)
 
 | Terme | Implémentation (`decision_engine.py`) |
 |---|---|
 | `S(z)` pertinence du signalement | priorité × confiance × fraîcheur des signalements connus |
-| `P(z)` probabilité de présence | déduite des observations uniquement (signalements, ancienneté de la dernière visite) |
+| `P(z)` probabilité de présence | observations uniquement (signalements, ancienneté de la dernière visite) |
 | `U(z)` intérêt d'exploration | 1.0 inconnue, 0.8 à revisiter, sinon décroît avec l'ancienneté |
-| `D(z)` coût du déplacement | distance Manhattan inter-zones |
+| `D(z)` coût du déplacement | distance haversine entre centres de zones (km) |
 
 **Fugitif** — `Score(z) = w1·E(z) + w2·S(z) − w3·R(z) − w4·C(z)`
 
@@ -483,63 +483,48 @@ derrière un reverse proxy interne.
 | `E(z)` intérêt d'exploration | identique à `U(z)` |
 | `S(z)` sécurité estimée | `1 − danger connu de la zone` |
 | `R(z)` risque de rencontre | danger mémorisé (zones où un policier a été vu) |
-| `C(z)` coût du déplacement | distance Manhattan inter-zones |
+| `C(z)` coût du déplacement | distance haversine (km) |
 
 Les poids sont ajustables dans la barre latérale Streamlit.
 
 ### 9.2 Priorités du cycle (§11)
 
 1. **Police** : signalement attribué → poursuite d'un fugitif **visible** → zones inconnues → revisite / patrouille du secteur assigné.
-2. **Fugitif** : fuite si policier dans `PANIC_RADIUS` → zones inconnues sûres → zones connues sûres.
-3. **Civil** : cellule voisine aléatoire à chaque pas.
+2. **Fugitif** : fuite si policier ≤ 300 m → zones inconnues sûres → zones connues sûres.
+3. **Civil** : nœud voisin aléatoire à chaque pas.
 
 ---
 
-## 10. Coordination policière (§8)
+## 10. Carte OpenStreetMap et temps réel
 
-`CoordinationManager` centralise :
-
-- **secteurs** : `assign_sectors()` distribue les zones entre policiers ;
-- **réservations** : `claim_zone()` empêche deux policiers d'inspecter la même zone simultanément ;
-- **signalements** : `take_unassigned_signal()` attribue le signalement pending le plus prioritaire ;
-- **observations** : `share_observation()` journalise les fugitifs vus.
-
-Le partage **ne fusionne pas** les mémoires : chaque policier conserve sa propre
-`SpatialMemory` (les zones vues par un autre restent « inconnues » localement).
-
----
+- **Chargement** : `osmnx.graph_from_place(place)` (ou `graph_from_point`) télécharge
+  le réseau routier réel ; le graphe est simplifié en `nx.Graph` pondéré par la
+  longueur réelle des rues (mètres).
+- **Rendu** : `map_render.build_map()` produit une carte Folium (tuiles
+  OpenStreetMap) avec : rectangles de zones colorés selon la mémoire de
+  l'agent sélectionné, marqueurs des agents (🛡️ police, ⚠️ fugitif, 👤 civil),
+  PolyLine de l'itinéraire A* courant.
+- **Temps réel** : le mode « ⏱️ Temps réel » exécute un pas Mesa puis
+  `st.rerun()` — la carte, les marqueurs, les zones et les métriques sont
+  rafraîchis à chaque pas selon la cadence choisie.
+- **Repli** : sans accès Overpass, une grille Manhattan synthétique centrée sur
+  la ville est générée (`load_synthetic_network`) ; l'indicateur « Source du
+  réseau » affiche le mode actif.
 
 ## 11. Pathfinding A* (§9)
 
-`PathFinder.find_path(start, goal, danger)` implémente A* 4-connexe :
+`PathFinder.find_path(start, goal, danger)` — A* networkx sur le graphe de rues :
 
-- `f(n) = g(n) + h(n)` avec heuristique de Manhattan (admissible) ;
-- coût d'entrée d'une cellule : `1.0 + 10 × danger_connu(cellule)` ;
-- obstacles exclus du graphe ;
-- recalcul automatique si l'itinéraire est obstrué ou terminé (F13).
-
----
+- `f(n) = g(n) + h(n)` ; poids des arcs = `longueur_rue × (1 + 10 × danger_connu(zone))` ;
+- heuristique haversine en mètres (admissible) ;
+- recalcul automatique si l'itinéraire devient invalide (F13).
 
 ## 12. Apprentissage par renforcement (§12, Phase 7)
 
-`RLModule` maintient des Q-values par zone (`q[zone]`) mises à jour par
-`q ← q + α·(r − q)` avec les récompenses de la spécification :
-
-| Agent | Événement | Récompense |
-|---|---|---:|
-| Police | Nouvelle zone inspectée | +5 |
-| Police | Signalement vérifié | +15 |
-| Police | Fugitif intercepté | +100 |
-| Police | Déplacement inutile | −5 |
-| Fugitif | Nouvelle zone explorée | +5 |
-| Fugitif | Évasion réussie | +100 |
-| Fugitif | Détection par la police | −20 |
-
-Le bonus `0.05 × q[zone]` est ajouté au score du moteur de décision. Aucune
-récompense ne révèle la position d'un adversaire (F12) : elle provient
-toujours d'un événement vécu par l'agent.
-
----
+`RLModule` : Q-values par zone, `q ← q + α·(r − q)`, récompenses de la spécification
+(+5 nouvelle zone, +15 signalement vérifié, +100 interception, −5 déplacement
+inutile, +100 évasion, −20 détection). Bonus `0.05 × q[zone]` ajouté au score.
+Aucune récompense ne révèle la position d'un adversaire (F12).
 
 ## 13. Traçabilité des exigences F01–F15
 
@@ -550,25 +535,24 @@ toujours d'un événement vécu par l'agent.
 | F03 | Civils aléatoires | `CivilStrategy.decide` | `test_f03` |
 | F04 | Mémoire individuelle | `SpatialMemory` par agent | tous |
 | F05 | Persistance des zones visitées | mémoire jamais réinitialisée | `test_f05_f14` |
-| F06 | Zones inconnues prioritaires | `_exploration_candidates` + score `U` | `test_1` |
+| F06 | Zones inconnues prioritaires | candidats + score `U` | `test_1` |
 | F07 | Revisite sur événement | `mark_to_revisit` + signalements | `test_2` |
 | F08 | Partage d'informations | `CoordinationManager` | `test_3` |
 | F09 | Éviter les doublons | `claim_zone`, secteurs | `test_3` |
 | F10 | Adaptation aux dangers | `known_dangers`, `_flee` | `test_4` |
-| F11 | Obstacles dans les itinéraires | A* avec obstacles | `test_f11` |
-| F12 | Pas d'omniscience | perception à rayon limité | `test_5` |
-| F13 | Recalcul des destinations | `route_is_blocked` + redécision | `test_f11` |
+| F11 | Obstacles / réseau réel | A* sur le graphe de rues | `test_f11` |
+| F12 | Pas d'omniscience | perception haversine à rayon limité | `test_5` |
+| F13 | Recalcul des destinations | `route_is_valid` + redécision | `test_f11` |
 | F14 | Historique conservé | `exploration_history` | `test_f05_f14` |
 | F15 | Amélioration par apprentissage | `RLModule` | `test_interception_possible` |
 
----
-
 ## 14. Utilisation de l'interface Streamlit
 
-1. Configurer le monde et les agents dans la **barre latérale** (taille, zones, obstacles, effectifs, vitesses, poids, RL).
-2. **🔄 Nouvelle simulation** réinitialise le monde avec ces paramètres.
-3. Avancer avec **▶ 1 pas**, **▶▶ 10 pas**, **▶▶▶ 50 pas** ou la **lecture auto**.
-4. Onglet **Carte** : positions des agents ; sélectionner un agent pour colorer les zones selon **sa** mémoire (⬜ inconnue, 🟦 explorée, 🟧 à revisiter).
-5. Onglet **Métriques** : couverture globale, signalements, résumé JSON.
-6. Onglet **Mémoire** : historique d'exploration et événements RL d'un agent.
-7. Onglet **Journal** : découvertes, observations partagées, interceptions.
+1. **Barre latérale** : ville OpenStreetMap (nom OSM), découpage en zones, rayon,
+   effectifs, vitesses, perception (mètres), poids des scores, RL, graine.
+2. **▶ 1 pas / ▶▶ 10 pas / ▶▶▶ 50 pas** : avancer la simulation Mesa.
+3. **⏱️ Temps réel** : exécution continue avec rafraîchissement de la carte OSM.
+4. Onglet **Carte OSM** : sélectionner un agent pour voir **sa** mémoire
+   (⬜ inconnue, 🟦 explorée, 🟧 à revisiter) et son itinéraire A* en bleu.
+5. Onglets **Métriques**, **Mémoire**, **Journal** : couverture, signalements,
+   historique d'exploration, observations partagées, interceptions.

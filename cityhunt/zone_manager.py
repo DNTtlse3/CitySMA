@@ -1,122 +1,120 @@
-"""Découpage et gestion des zones de la ville (module zone_manager)."""
+"""Découpage géographique de la ville en zones (module zone_manager).
+
+Le rectangle englobant du réseau OSM est partitionné en une grille
+``cols x rows`` de zones ; chaque zone référence les nœuds du réseau
+qu'elle contient.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from .osm_network import CityNetwork, haversine_m
+
 
 @dataclass
 class Zone:
-    """Zone d'exploration de la ville.
-
-    Attributs :
-        id          : identifiant unique de la zone.
-        position    : centre de la zone (colonne, ligne) sur la grille.
-        bounds      : (x0, y0, x1, y1) cellules inclusives couvertes par la zone.
-        neighbors   : identifiants des zones voisines.
-        visited_by  : ensembles d'agents ayant visité la zone (connaissance globale).
-        last_visit  : dernier pas de visite par agent.
-        signals     : identifiants des signalements rattachés à la zone.
-    """
+    """Zone d'exploration : rectangle géographique + nœuds du réseau."""
 
     id: int
-    position: tuple[int, int]
-    bounds: tuple[int, int, int, int]
+    bounds: tuple[float, float, float, float]   # (lat_min, lat_max, lon_min, lon_max)
+    center: tuple[float, float]                 # (lat, lon)
+    row: int
+    col: int
     neighbors: set[int] = field(default_factory=set)
+    nodes: list = field(default_factory=list)
     visited_by: set[str] = field(default_factory=set)
     last_visit: dict[str, int] = field(default_factory=dict)
     signals: list[str] = field(default_factory=list)
 
-    def contains(self, cell: tuple[int, int]) -> bool:
-        x, y = cell
-        x0, y0, x1, y1 = self.bounds
-        return x0 <= x <= x1 and y0 <= y <= y1
-
-    def cells(self):
-        x0, y0, x1, y1 = self.bounds
-        for y in range(y0, y1 + 1):
-            for x in range(x0, x1 + 1):
-                yield (x, y)
-
-    def center(self) -> tuple[int, int]:
-        x0, y0, x1, y1 = self.bounds
-        return ((x0 + x1) // 2, (y0 + y1) // 2)
-
 
 class ZoneManager:
-    """Découpe la grille en zones contiguës et gère leurs relations.
+    """Partitionne la bbox du réseau et indexe les nœuds par zone."""
 
-    La grille est divisée en ``grid_cols x grid_rows`` zones régulières.
-    Les obstacles sont posés au niveau des cellules, jamais au niveau des zones :
-    une zone reste donc toujours explorable même si certaines cellules sont bloquées.
-    """
-
-    def __init__(self, width: int, height: int, zone_cols: int, zone_rows: int):
-        if width < zone_cols or height < zone_rows:
-            raise ValueError("La grille doit être au moins aussi grande que le découpage en zones.")
-        self.width = width
-        self.height = height
-        self.zone_cols = zone_cols
-        self.zone_rows = zone_rows
+    def __init__(self, network: CityNetwork, cols: int = 4, rows: int = 4):
+        if cols < 1 or rows < 1:
+            raise ValueError("Le découpage doit comporter au moins une zone par axe.")
+        self.network = network
+        self.cols = cols
+        self.rows = rows
+        lat_min, lat_max, lon_min, lon_max = network.bbox()
+        self.lat_min, self.lat_max = lat_min, lat_max
+        self.lon_min, self.lon_max = lon_min, lon_max
         self.zones: dict[int, Zone] = {}
-        self.obstacles: set[tuple[int, int]] = set()
+        self.node_zone: dict = {}
         self._build_zones()
         self._link_neighbors()
+        self._index_nodes()
+
+    # ------------------------------------------------------------------ #
 
     def _build_zones(self) -> None:
-        zw = self.width / self.zone_cols
-        zh = self.height / self.zone_rows
+        dlat = (self.lat_max - self.lat_min) / self.rows
+        dlon = (self.lon_max - self.lon_min) / self.cols
         zid = 0
-        for zy in range(self.zone_rows):
-            for zx in range(self.zone_cols):
-                x0 = int(round(zx * zw))
-                x1 = int(round((zx + 1) * zw)) - 1
-                y0 = int(round(zy * zh))
-                y1 = int(round((zy + 1) * zh)) - 1
+        for row in range(self.rows):
+            for col in range(self.cols):
+                b = (self.lat_min + row * dlat, self.lat_min + (row + 1) * dlat,
+                     self.lon_min + col * dlon, self.lon_min + (col + 1) * dlon)
                 self.zones[zid] = Zone(
-                    id=zid,
-                    position=((x0 + x1) // 2, (y0 + y1) // 2),
-                    bounds=(x0, y0, x1, y1),
+                    id=zid, bounds=b,
+                    center=((b[0] + b[1]) / 2, (b[2] + b[3]) / 2),
+                    row=row, col=col,
                 )
                 zid += 1
 
     def _link_neighbors(self) -> None:
         for zone in self.zones.values():
-            x0, y0, x1, y1 = zone.bounds
             for other in self.zones.values():
-                if other.id == zone.id:
-                    continue
-                ox0, oy0, ox1, oy1 = other.bounds
-                touches_x = ox0 <= x1 + 1 and ox1 + 1 >= x0
-                touches_y = oy0 <= y1 + 1 and oy1 + 1 >= y0
-                if touches_x and touches_y:
+                if abs(zone.row - other.row) <= 1 and abs(zone.col - other.col) <= 1 \
+                        and other.id != zone.id:
                     zone.neighbors.add(other.id)
 
-    def zone_of(self, cell: tuple[int, int]) -> int:
-        for zone in self.zones.values():
-            if zone.contains(cell):
-                return zone.id
-        raise ValueError(f"Cellule {cell} hors de la carte.")
+    def _index_nodes(self) -> None:
+        for node, data in self.network.graph.nodes(data=True):
+            zid = self._locate(data["y"], data["x"])
+            self.zones[zid].nodes.append(node)
+            self.node_zone[node] = zid
 
-    def free_cells(self, zone_id: int) -> list[tuple[int, int]]:
-        return [c for c in self.zones[zone_id].cells() if c not in self.obstacles]
+    def _locate(self, lat: float, lon: float) -> int:
+        dlat = (self.lat_max - self.lat_min) / self.rows
+        dlon = (self.lon_max - self.lon_min) / self.cols
+        row = min(self.rows - 1, max(0, int((lat - self.lat_min) / dlat)))
+        col = min(self.cols - 1, max(0, int((lon - self.lon_min) / dlon)))
+        return row * self.cols + col
 
-    def random_free_cell(self, rng, zone_id: int | None = None) -> tuple[int, int]:
-        if zone_id is None:
-            candidates = [
-                (x, y) for x in range(self.width) for y in range(self.height)
-                if (x, y) not in self.obstacles
-            ]
-        else:
-            candidates = self.free_cells(zone_id)
-        if not candidates:
-            raise ValueError("Aucune cellule libre disponible.")
-        return rng.choice(candidates)
+    # ------------------------------------------------------------------ #
 
-    def add_obstacle(self, cell: tuple[int, int]) -> None:
-        self.obstacles.add(cell)
+    def zone_of(self, node) -> int:
+        return self.node_zone[node]
+
+    def zone_of_point(self, lat: float, lon: float) -> int:
+        return self._locate(lat, lon)
+
+    def nodes_in_zone(self, zone_id: int) -> list:
+        return self.zones[zone_id].nodes
+
+    def zone_centroid(self, zone_id: int) -> tuple[float, float]:
+        return self.zones[zone_id].center
+
+    def random_node_in_zone(self, rng, zone_id: int):
+        nodes = self.zones[zone_id].nodes
+        return rng.choice(nodes) if nodes else None
+
+    def nearest_zone_node(self, zone_id: int, point: tuple[float, float]):
+        """Nœud de la zone le plus proche du point (lat, lon)."""
+        nodes = self.zones[zone_id].nodes
+        if not nodes:
+            return None
+        return min(nodes, key=lambda n: haversine_m(self.network.coords(n), point))
+
+    def farthest_zone_node_from(self, zone_id: int, point: tuple[float, float]):
+        """Nœud de la zone le plus loin du point (lat, lon)."""
+        nodes = self.zones[zone_id].nodes
+        if not nodes:
+            return None
+        return max(nodes, key=lambda n: haversine_m(self.network.coords(n), point))
 
     def distance(self, zone_a: int, zone_b: int) -> float:
-        ax, ay = self.zones[zone_a].position
-        bx, by = self.zones[zone_b].position
-        return abs(ax - bx) + abs(ay - by)
+        """Distance en mètres entre les centres de deux zones."""
+        return haversine_m(self.zone_centroid(zone_a), self.zone_centroid(zone_b))

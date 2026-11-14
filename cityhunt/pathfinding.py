@@ -1,81 +1,56 @@
-"""Calcul des itinéraires par A* (module pathfinding).
+"""Calcul des itinéraires sur le réseau OSM (module pathfinding).
 
-f(n) = g(n) + h(n), heuristique de Manhattan, obstacles et zones dangereuses
-pris en compte dans le coût des cellules.
+A* de networkx sur le graphe de rues :
+    f(n) = g(n) + h(n)
+    - poids des arcs : longueur (m) majorée du danger connu de la zone cible ;
+    - heuristique : distance haversine (admissible, en mètres).
 """
 
 from __future__ import annotations
 
-import heapq
-import math
+import networkx as nx
+
+from .osm_network import haversine_m
 
 
 class PathFinder:
-    """A* sur grille 4-connexe avec obstacles et surcoûts de danger."""
+    """A* sur le réseau de rues avec surcoûts de danger par zone."""
 
-    def __init__(self, width: int, height: int, obstacles: set[tuple[int, int]] | None = None):
-        self.width = width
-        self.height = height
-        self.obstacles = obstacles or set()
+    DANGER_PENALTY = 10.0
 
-    @staticmethod
-    def neighbors(cell: tuple[int, int]):
-        x, y = cell
-        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-            yield (x + dx, y + dy)
+    def __init__(self, network, zone_manager):
+        self.network = network
+        self.graph = network.graph
+        self.zones = zone_manager
 
-    def cell_cost(self, cell: tuple[int, int], danger: dict[tuple[int, int], float] | None = None) -> float:
-        """Coût d'entrée dans une cellule : 1.0 + surcoût de danger connu."""
-        cost = 1.0
-        if danger:
-            cost += danger.get(cell, 0.0) * 10.0
-        return cost
-
-    def heuristic(self, a: tuple[int, int], b: tuple[int, int]) -> float:
-        return abs(a[0] - b[0]) + abs(a[1] - b[1])
-
-    def find_path(
-        self,
-        start: tuple[int, int],
-        goal: tuple[int, int],
-        danger: dict[tuple[int, int], float] | None = None,
-    ) -> list[tuple[int, int]] | None:
-        """Retourne la liste des cellules du chemin (start exclu, goal inclus),
-        ou None si aucun chemin n'existe."""
+    def find_path(self, start, goal, danger_zones: dict[int, float] | None = None):
+        """Chemin (liste de nœuds, start exclu, goal inclus) ou None."""
         if start == goal:
             return []
-        if goal in self.obstacles or start in self.obstacles:
+        if start not in self.graph or goal not in self.graph:
             return None
+        danger = danger_zones or {}
 
-        open_heap: list[tuple[float, float, tuple[int, int]]] = []
-        counter = 0
-        g_score: dict[tuple[int, int], float] = {start: 0.0}
-        came_from: dict[tuple[int, int], tuple[int, int]] = {}
-        heapq.heappush(open_heap, (self.heuristic(start, goal), counter, start))
+        def weight(u, v, _data):
+            z = self.zones.node_zone.get(v)
+            penalty = 1.0 + self.DANGER_PENALTY * danger.get(z, 0.0)
+            return self.network.edge_length(u, v) * penalty
 
-        while open_heap:
-            f, _, current = heapq.heappop(open_heap)
-            if current == goal:
-                return self._reconstruct(came_from, current)
-            for nxt in self.neighbors(current):
-                if nxt in self.obstacles:
-                    continue
-                if not (0 <= nxt[0] < self.width and 0 <= nxt[1] < self.height):
-                    continue
-                tentative = g_score[current] + self.cell_cost(nxt, danger)
-                if tentative < g_score.get(nxt, math.inf):
-                    g_score[nxt] = tentative
-                    came_from[nxt] = current
-                    counter += 1
-                    heapq.heappush(open_heap, (tentative + self.heuristic(nxt, goal), counter, nxt))
-        return None
+        def heuristic(u, v):
+            return haversine_m(self.network.coords(u), self.network.coords(v))
 
-    @staticmethod
-    def _reconstruct(came_from: dict, current: tuple[int, int]) -> list[tuple[int, int]]:
-        path = [current]
-        while current in came_from:
-            current = came_from[current]
-            path.append(current)
-        path.reverse()
-        path = path[1:]
-        return path
+        try:
+            path = nx.astar_path(self.graph, start, goal, heuristic=heuristic, weight=weight)
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
+            return None
+        return path[1:]
+
+    def path_length(self, path) -> float:
+        if not path:
+            return 0.0
+        total = 0.0
+        u = path[0]
+        for v in path[1:]:
+            total += self.network.edge_length(u, v)
+            u = v
+        return total

@@ -1,4 +1,4 @@
-"""Stratégie des fugitifs (module fugitive_strategy).
+"""Stratégie des fugitifs sur le réseau OSM (module fugitive_strategy).
 
 Cycle de décision avec priorité supplémentaire : réaction aux dangers observés.
 Le fugitif n'utilise que ses observations et sa mémoire (exigence F12).
@@ -6,39 +6,35 @@ Le fugitif n'utilise que ses observations et sa mémoire (exigence F12).
 
 from __future__ import annotations
 
-from .spatial_memory import TO_REVISIT, UNKNOWN
+from .osm_network import haversine_m
+from .spatial_memory import TO_REVISIT
 
 
 class FugitiveStrategy:
     role = "fugitive"
 
-    PANIC_RADIUS = 6
+    PANIC_RADIUS_M = 300.0
 
     def __init__(self, decision_engine):
         self.engine = decision_engine
 
-    def decide(self, agent, env) -> None:
+    def decide(self, agent, model) -> None:
         memory = agent.memory
-        step = env.step_count
 
-        visible_police = env.visible_police(agent)
+        visible_police = model.visible_police(agent)
         if visible_police:
-            nearest = min(
-                visible_police,
-                key=lambda p: abs(p.position[0] - agent.position[0]) + abs(p.position[1] - agent.position[1]),
-            )
-            dist = abs(nearest.position[0] - agent.position[0]) + abs(nearest.position[1] - agent.position[1])
-            if dist <= self.PANIC_RADIUS:
-                agent.rl.reward("detection")
-                if self._flee(agent, env, nearest):
+            nearest = min(visible_police, key=lambda p: self._dist(agent, p, model))
+            if self._dist(agent, nearest, model) <= self.PANIC_RADIUS_M:
+                agent.rl.reward("detection", model.zones.zone_of(agent.position), model.step_count)
+                if self._flee(agent, model, nearest):
                     return
 
         candidates = {
             z for z in memory.unvisited_zones
-            if memory.danger_of(z) < 0.5 and env.zone_manager.free_cells(z)
+            if memory.danger_of(z) < 0.5 and model.zones.nodes_in_zone(z)
         }
         if candidates:
-            self._goto_best(agent, env, candidates, step)
+            self._goto_best(agent, model, candidates)
             return
 
         revisit = {
@@ -46,31 +42,32 @@ class FugitiveStrategy:
             if memory.state_of(z) in (TO_REVISIT, "explorée")
             and memory.danger_of(z) < 0.4
             and z != memory.current_zone
+            and model.zones.nodes_in_zone(z)
         }
         if revisit:
-            self._goto_best(agent, env, revisit, step)
+            self._goto_best(agent, model, revisit)
             return
         agent.set_path([])
 
     # ------------------------------------------------------------------ #
 
-    def _flee(self, agent, env, nearest_police) -> bool:
-        """Fuite : choisir la zone voisine la plus sûre et la plus éloignée de la police."""
+    @staticmethod
+    def _dist(a, b, model) -> float:
+        return haversine_m(model.network.coords(a.position), model.network.coords(b.position))
+
+    def _flee(self, agent, model, nearest_police) -> bool:
+        """Fuite : zone voisine la plus sûre et la plus éloignée du policier."""
         memory = agent.memory
-        current = memory.current_zone
-        if current is None:
-            return False
-        options = set(env.zone_manager.zones[current].neighbors) | {current}
-        px, py = nearest_police.position
+        current = model.zones.zone_of(agent.position)
+        options = set(model.zones.zones[current].neighbors) | {current}
+        px, py = model.network.coords(nearest_police.position)
 
         best_zone, best_score = None, float("-inf")
         for zid in options:
-            if not env.zone_manager.free_cells(zid):
+            if not model.zones.nodes_in_zone(zid):
                 continue
-            zx, zy = env.zone_manager.zones[zid].position
-            dist_police = abs(zx - px) + abs(zy - py)
-            danger = memory.danger_of(zid)
-            score = dist_police - 20.0 * danger
+            zlat, zlon = model.zones.zone_centroid(zid)
+            score = haversine_m((zlat, zlon), (px, py)) / 100.0 - 20.0 * memory.danger_of(zid)
             if zid == current:
                 score -= 3.0
             if score > best_score:
@@ -78,8 +75,10 @@ class FugitiveStrategy:
         if best_zone is None:
             return False
 
-        target_cell = env.farthest_free_cell_from(best_zone, px, py)
-        path = env.path_to(agent, target_cell)
+        target = model.zones.farthest_zone_node_from(best_zone, (px, py))
+        if target is None:
+            return False
+        path = model.pathfinder.find_path(agent.position, target, memory.known_dangers)
         if path is None:
             return False
         agent.set_path(path)
@@ -87,16 +86,16 @@ class FugitiveStrategy:
         agent.target_zone = best_zone
         return True
 
-    def _goto_best(self, agent, env, candidates: set[int], step: int) -> None:
+    def _goto_best(self, agent, model, candidates: set[int]) -> None:
         memory = agent.memory
-        distances = {
-            zid: env.zone_manager.distance(memory.current_zone, zid) if memory.current_zone is not None else 0.0
-            for zid in candidates
-        }
-        ranked = self.engine.rank_zones(self.role, memory, step, distances, candidates)
+        here = model.zones.zone_of(agent.position)
+        distances = {z: model.zones.distance(here, z) / 1000.0 for z in candidates}
+        ranked = self.engine.rank_zones(self.role, memory, model.step_count, distances, candidates)
         for zid, _score in ranked:
-            target_cell = env.best_entry_cell(agent, zid)
-            path = env.path_to(agent, target_cell)
+            target = model.zones.nearest_zone_node(zid, model.network.coords(agent.position))
+            if target is None:
+                continue
+            path = model.pathfinder.find_path(agent.position, target, memory.known_dangers)
             if path is None:
                 continue
             agent.set_path(path)
