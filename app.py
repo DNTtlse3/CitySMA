@@ -30,8 +30,11 @@ st.caption("Moteur Mesa · mémoire spatiale individuelle · exploration méthod
 # --------------------------------------------------------------------------- #
 
 @st.cache_resource(show_spinner="Chargement du réseau OpenStreetMap…")
-def load_city(place: str, dist_m: int) -> tuple:
-    network = load_city_network(place=place, dist_m=dist_m)
+def load_city(place: str, dist_m: int, lat: float = 0.0, lon: float = 0.0) -> tuple:
+    if lat and lon:
+        network = load_city_network(center=(lat, lon), dist_m=dist_m)
+    else:
+        network = load_city_network(place=place, dist_m=dist_m)
     return network, network.source
 
 
@@ -47,11 +50,20 @@ def load_fallback(place: str, seed: int) -> tuple:
 
 def sidebar() -> None:
     st.sidebar.subheader("🗺️ Carte OpenStreetMap")
-    st.sidebar.text_input("Ville (nom OSM)", "Toulouse, France", key="place")
+    st.sidebar.text_input("Ville (nom OSM)", "Toulouse, France", key="place",
+                          help="Ex. : Saint-André, Réunion, France")
+    c1, c2 = st.sidebar.columns(2)
+    c1.number_input("Latitude (option)", -90.0, 90.0, 0.0, 0.0001,
+                    key="center_lat", format="%.5f",
+                    help="Si lat et lon ≠ 0, priorité sur le nom de ville. "
+                         "Saint-André (Réunion) : -20.9606, 55.6493")
+    c2.number_input("Longitude (option)", -180.0, 180.0, 0.0, 0.0001,
+                    key="center_lon", format="%.5f")
     c1, c2 = st.sidebar.columns(2)
     c1.number_input("Zones en X", 1, 10, 4, key="zone_cols")
     c2.number_input("Zones en Y", 1, 10, 4, key="zone_rows")
-    st.sidebar.number_input("Rayon de la zone (m)", 300, 5000, 900, 100, key="dist_m")
+    st.sidebar.number_input("Rayon de la zone (m)", 300, 20000, 2000, 100, key="dist_m",
+                            help="Rayon autour du point central (mode coordonnées)")
 
     st.sidebar.subheader("Agents")
     c1, c2, c3 = st.sidebar.columns(3)
@@ -92,7 +104,8 @@ def sidebar() -> None:
 def build_model() -> CityHuntModel:
     c = st.session_state
     try:
-        network, source = load_city(c["place"], c["dist_m"])
+        network, source = load_city(c["place"], c["dist_m"],
+                                    c["center_lat"], c["center_lon"])
     except Exception:
         network, source = load_fallback(c["place"], c["seed"])
     st.session_state.map_source = source
